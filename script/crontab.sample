@@ -1,0 +1,120 @@
+#-----------------------------------------------------------------------------
+# waf-rule — crontab 設定サンプル
+#
+# 使い方:
+#   1. 下の WAF_DIR と ARN_* を、実際の環境の値に書き換える
+#   2. 必要な行だけを crontab -e に貼る
+#   3. 最初は --apply を外した状態で1日流し、ログを見てから --apply を付ける
+#
+# 対象の ARN はここで管理する:
+#   ARN は環境ごとに異なる値なので、スクリプト側には持たせていない。
+#   ここで変数に入れておけば、対象を増やすときもこのファイルだけで完結する。
+#   ARN はコンソールの IP sets 詳細画面に表示されている。
+#
+# 前提:
+#   EC2 で動かす場合、インスタンスに下記3権限を持つ IAM ロールを付与しておくこと
+#     wafv2:ListIPSets / wafv2:GetIPSet / wafv2:UpdateIPSet
+#
+# 重要:
+#   --pipe を必ず付ける。付けないと Enter 待ちで止まり、プロセスが残り続ける。
+#
+# [zjk 2026-09-18 AI補助]
+#-----------------------------------------------------------------------------
+
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# 配置場所とログの出力先
+WAF_DIR=/opt/waf-rule/script
+WAF_LOG=/var/log/waf-ipset.log
+
+#--- 反映先の IPSet（コンソールの IP sets 詳細画面の ARN を貼る）---------------
+# CloudFront（グローバル）… リージョンは必ず us-east-1
+ARN_CF_V4=arn:aws:wafv2:us-east-1:123456789012:global/ipset/名前/ID
+ARN_CF_V6=arn:aws:wafv2:us-east-1:123456789012:global/ipset/名前/ID
+
+# ALB（リージョン）
+ARN_ALB_V4=arn:aws:wafv2:ap-northeast-1:123456789012:regional/ipset/名前/ID
+ARN_ALB_V6=arn:aws:wafv2:ap-northeast-1:123456789012:regional/ipset/名前/ID
+
+
+#=============================================================================
+# 【構成A】CloudFront と ALB の両方へ反映する（IPv4のみ）
+#
+# 最小構成。IPv6 でのアクセスを受けていないなら、これで足りる。
+# 1主体につき2回（CloudFront用・ALB用）実行する。
+#=============================================================================
+
+# --- Google（Gemini もこのIPに含まれる）---
+05 4 * * * cd $WAF_DIR && ./get-google-ip.sh | ./waf-ipset.sh replace -f - --arn=$ARN_CF_V4  --apply --pipe >> $WAF_LOG 2>&1
+10 4 * * * cd $WAF_DIR && ./get-google-ip.sh | ./waf-ipset.sh replace -f - --arn=$ARN_ALB_V4 --apply --pipe >> $WAF_LOG 2>&1
+
+# --- Bing（Copilot / Yahoo / DuckDuckGo もこのIPに含まれる）---
+15 4 * * * cd $WAF_DIR && ./get-bing-ip.sh | ./waf-ipset.sh replace -f - --arn=$ARN_CF_V4  --apply --pipe >> $WAF_LOG 2>&1
+20 4 * * * cd $WAF_DIR && ./get-bing-ip.sh | ./waf-ipset.sh replace -f - --arn=$ARN_ALB_V4 --apply --pipe >> $WAF_LOG 2>&1
+
+# --- OpenAI（既定は検索用のみ。学習用も含めるなら --all）---
+25 4 * * * cd $WAF_DIR && ./get-openai-ip.sh | ./waf-ipset.sh replace -f - --arn=$ARN_CF_V4  --apply --pipe >> $WAF_LOG 2>&1
+30 4 * * * cd $WAF_DIR && ./get-openai-ip.sh | ./waf-ipset.sh replace -f - --arn=$ARN_ALB_V4 --apply --pipe >> $WAF_LOG 2>&1
+
+# --- Claude ---
+35 4 * * * cd $WAF_DIR && ./get-claude-ip.sh | ./waf-ipset.sh replace -f - --arn=$ARN_CF_V4  --apply --pipe >> $WAF_LOG 2>&1
+40 4 * * * cd $WAF_DIR && ./get-claude-ip.sh | ./waf-ipset.sh replace -f - --arn=$ARN_ALB_V4 --apply --pipe >> $WAF_LOG 2>&1
+
+
+#=============================================================================
+# 【構成B】IPv6 も反映する場合は、上に加えて以下も設定する
+#
+# IPv6 を公開しているのは実質 Google のみ（Bing / OpenAI / Claude は0件）。
+# そのため Google の分だけで足りる。
+#=============================================================================
+
+45 4 * * * cd $WAF_DIR && ./get-google-ip.sh --ipv6 | ./waf-ipset.sh replace -f - --arn=$ARN_CF_V6  --apply --pipe >> $WAF_LOG 2>&1
+50 4 * * * cd $WAF_DIR && ./get-google-ip.sh --ipv6 | ./waf-ipset.sh replace -f - --arn=$ARN_ALB_V6 --apply --pipe >> $WAF_LOG 2>&1
+
+
+#=============================================================================
+# 【最初の1週間】--apply を付けずに流して様子を見る場合
+#
+# 書き込まずに「何が起きるか」だけをログに出す。
+# 差分と件数が想定どおりか確認してから、上の行に切り替える。
+#=============================================================================
+
+# 05 4 * * * cd $WAF_DIR && ./get-google-ip.sh | ./waf-ipset.sh replace -f - --arn=$ARN_ALB_V4 --pipe >> $WAF_LOG 2>&1
+
+
+#=============================================================================
+# ログの確認方法
+#=============================================================================
+#
+# 異常だけを拾う:
+#   grep ERROR /var/log/waf-ipset.log
+#
+# 前日分の異常を拾う:
+#   grep "$(date -d yesterday +%F)" /var/log/waf-ipset.log | grep ERROR
+#
+# ログローテーション（/etc/logrotate.d/waf-ipset に置く）:
+#   /var/log/waf-ipset.log {
+#       weekly
+#       rotate 12
+#       compress
+#       missingok
+#       notifempty
+#   }
+#
+#-----------------------------------------------------------------------------
+# 補足
+#
+# ・実行間隔を5分ずつ空けているのは、同時実行で AWS の API 制限
+#   （更新系は1秒1回）に当たるのを避けるため。
+#   4主体×2スコープ=8回でも、この間隔なら余裕がある。
+#
+# ・1日1回で十分。Google は毎日更新されるが、Bing は2年以上変化していない。
+#   頻度を上げても得るものはほとんどない。
+#
+# ・変更が無い日は終了コード3で終わり、AWSへの書き込みは発生しない。
+#   ログには「変更はありません」と出る。これは正常。
+#
+# ・crontab の中では % がそのまま使えない（改行扱いになる）。
+#   日付を使うコマンドを直接書く場合は \% とエスケープすること。
+#-----------------------------------------------------------------------------

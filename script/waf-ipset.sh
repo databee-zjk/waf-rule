@@ -9,23 +9,37 @@
 #   操作対象は IPSet であり、Web ACL ではない（Web ACL は IPSet を参照するだけ）。
 #
 # 【用法（最もよく使う形）】
-#   ./waf-ipset.sh list                              現在の登録内容を表示
-#   ./waf-ipset.sh add 203.0.113.5/32                1件追加（模擬実行）
-#   ./waf-ipset.sh add 203.0.113.5/32 --apply        1件追加（本当に書き込む）
-#   ./waf-ipset.sh add 203.0.113.0/24 198.51.100.0/24 --apply   複数件追加
-#   ./waf-ipset.sh add -f list.txt --apply           ファイルから追加
-#   ./waf-ipset.sh del 203.0.113.5/32 --apply        削除
-#   ./waf-ipset.sh replace -f list.txt --apply       全件置換（既存は全て消える）
+#   ARN は長いため、変数に入れて使うと読みやすい。
+#     ARN=arn:aws:wafv2:ap-northeast-1:123456789012:regional/ipset/名前/ID
 #
+#   ./waf-ipset.sh list --arn=$ARN                       現在の登録内容を表示
+#   ./waf-ipset.sh add 203.0.113.5/32 --arn=$ARN         1件追加（模擬実行）
+#   ./waf-ipset.sh add 203.0.113.5/32 --arn=$ARN --apply 本当に書き込む
+#   ./waf-ipset.sh del 203.0.113.5/32 --arn=$ARN --apply 削除
+#   ./waf-ipset.sh replace -f list.txt --arn=$ARN --apply 全件置換
+#   ./waf-ipset.sh clear --arn=$ARN --apply              全件削除して空にする
+#
+# 【操作対象は ARN で指定する】
+#   ARN にはリージョン・スコープ・IPSet名・ID が全て含まれているため、
+#   これ1つで対象が確定する。それらを個別に設定する必要はない。
+#     --arn=<ARN>  実行ごとに対象を指定する（複数の対象へ反映する場合はこちら）
+#     未指定なら、スクリプト上部の IPSET_ARN_DEFAULT が使われる
+#
+# 【CloudFront と ALB は別々に反映する必要がある】
+#   WAF は CloudFront（グローバル / us-east-1）と ALB（リージョン）で
+#   設定場所が分かれており、同じIPリストを使うなら両方へ反映する。
+#   さらに IPv4 と IPv6 も別の IPSet になる（AWSの仕様で混在不可）。
+#   → 1つの主体につき最大4回の実行になる。
 #
 # 【基本の使い方 — 取得スクリプトとパイプで繋ぐ】
 #
-#   <取得スクリプト> | ./waf-ipset.sh replace -f - --IPSET_NAME=<名前> --apply
+#   <取得スクリプト> | ./waf-ipset.sh replace -f - --arn=<ARN> --apply
 #
-#   実例:
-#     ./get-google-ip.sh | ./waf-ipset.sh replace -f - --IPSET_NAME=google-list --apply
-#     ./get-bing-ip.sh   | ./waf-ipset.sh replace -f - --IPSET_NAME=bing-list   --apply
-#     ./get-claude-ip.sh | ./waf-ipset.sh replace -f - --IPSET_NAME=claude-list --apply
+#   実例（CloudFront と ALB の両方へ、IPv4とIPv6を反映する）:
+#     ./get-google-ip.sh        | ./waf-ipset.sh replace -f - --arn=$ARN_ALB_V4 --apply
+#     ./get-google-ip.sh        | ./waf-ipset.sh replace -f - --arn=$ARN_CF_V4  --apply
+#     ./get-google-ip.sh --ipv6 | ./waf-ipset.sh replace -f - --arn=$ARN_ALB_V6 --apply
+#     ./get-google-ip.sh --ipv6 | ./waf-ipset.sh replace -f - --arn=$ARN_CF_V6  --apply
 #
 #   主体ごとに IPSet を分けておくと、Google は許可・GPTBot は拒否、のように
 #   別々の方針を当てられる。1つにまとめると、この出し分けができなくなる。
@@ -47,7 +61,8 @@
 #   2 と 3 で止まる。上流の成否そのものを見たい場合は PIPESTATUS を確認すること。
 #
 # 【入参】
-#   第1引数   サブコマンド: list | add | del | replace
+#   第1引数   サブコマンド: list / add / del / replace / clear
+#             （list と clear は CIDR を取らない）
 #   第2引数～ CIDR を直接指定、または -f <ファイル|->（1行1件、空行と # 行は無視）
 #   オプション:
 #     --apply    実際に書き込む。付けない限り必ず模擬実行（安全側の既定）
@@ -56,16 +71,14 @@
 # 【出参】
 #   標準出力: list のIPリストのみ（データ専用。パイプで次へ渡せるようにするため）
 #   標準エラー: 進捗・差分・実行記録・エラー（crontab では 2>&1 でログに残す）
-#   ファイル: analysis/update-<IPSet名>.json のみ（aws CLI へ渡すため技術的に必要）。
+#   ファイル: analysis/update-<スコープ>-<IPSet名>.json のみ（aws CLI へ渡すため必要）。
 #             毎回上書きし、履歴は残さない。現在の内容は list で、実行記録はログで確認する。
 #   終了コード: 0=変更あり / 3=変更なし（既に目的の状態） / 2=引数エラー / 1=実行エラー
 #
 # 【設定の上書き】
-#   すべての設定は「--項目名=値」で一時的に上書きできる。設定項目名がそのまま引数名。
-#   別のIPSetや別リージョンに同じスクリプトを使い回すための仕組み。
-#     ./waf-ipset.sh list --IPSET_NAME=other-list
-#     ./waf-ipset.sh list --IPSET_SCOPE=CLOUDFRONT --AWS_REGION=us-east-1
-#     ./waf-ipset.sh add 203.0.113.0/24 --AWS_PROFILE_NAME=prod --apply
+#   対象以外の設定も「--項目名=値」で一時的に上書きできる。設定項目名がそのまま引数名。
+#     ./waf-ipset.sh add 203.0.113.0/24 --arn=$ARN --AWS_PROFILE_NAME=prod --apply
+#     ./waf-ipset.sh replace -f x.txt --arn=$ARN --MAX_SHRINK_PERCENT=100 --apply
 #   指定できる項目は --help で一覧表示する。
 #
 # 【実行環境】
@@ -77,8 +90,10 @@
 #   本スクリプトの実行によって発生する AWS 費用はない。
 #   ※ WAF 自体の月額（Web ACL $5.00/月、ルール $1.00/月）は本スクリプトとは無関係に発生する。
 #
-# 【制限】
-#   IPv4 のみ対応。IPSet が IPv6 の場合はエラーで停止する（誤操作防止のため）。
+# 【IPv4 / IPv6】
+#   どちらも対応している。入力された CIDR から自動判別し、
+#   対象の IPSet の種別と食い違う場合は書き込まずに停止する。
+#   IPv6 はネットワークアドレスの判定のみ省略している（形式と範囲は検査する）。
 #
 # [zjk 2026-09-18 AI補助]
 # ============================================================================
@@ -87,27 +102,47 @@ set -u
 
 # ---- 本スクリプトの設定（改这里）------------------------------------------
 #
-# AWS_PROFILE_NAME / AWS_REGION / LOG_DIR は複数のスクリプトで共通のため
-# config.sh にある。ここには本スクリプト固有の設定だけを置く。
+# AWS_PROFILE_NAME / LOG_DIR は複数のスクリプトで共通のため config.sh にある。
+# AWS_REGION は ARN から自動で決まるので、ここでは設定しない。
 #
-# すべての設定は「--項目名=値」で一時的に上書きできる（--help で一覧）。
-#   例: ./waf-ipset.sh list --IPSET_NAME=other-list --AWS_REGION=us-east-1
+# 対象は --arn=<ARN> で指定する（未指定なら IPSET_ARN_DEFAULT）。
+# それ以外の設定は「--項目名=値」で一時的に上書きできる（--help で一覧）。
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 . "${SCRIPT_DIR}/config.sh"
 
-# IPSet のスコープ。CloudFront に紐づく WAF なら CLOUDFRONT、
-# ALB / API Gateway に紐づくなら REGIONAL。間違えると IPSet が見つからない。
-IPSET_SCOPE="REGIONAL"
+# 操作対象の IPSet を ARN で指定する。
+#
+# ARN には リージョン / スコープ / 名前 / ID の4つが全て含まれているため、
+# これ1つで対象が確定する。個別に書き分ける必要はない。
+#   arn:aws:wafv2:<リージョン>:<アカウント>:<global|regional>/ipset/<名前>/<ID>
+#                  ~~~~~~~~~~                ~~~~~~~~~~~~~~~~        ~~~~~~  ~~~~
+#                  AWS_REGION                global=CLOUDFRONT       名前    ID
+#                                            regional=REGIONAL
+#
+# ARN はコンソールの IP sets の詳細画面に表示される。
+#
+# 【ここに書くのは「よく使う1つ」だけ】
+#   複数の対象へ反映する場合は、実行時に --arn=<ARN> で指定する。
+#   対象は環境ごとに異なる値なので、スクリプトに一覧を持たせない。
+#   crontab に書く場合は crontab.sample のように変数で定義すると見通しが良い。
+#
+# 【CloudFront と ALB は別々に反映が必要】
+#   WAF は CloudFront（グローバル / us-east-1）と ALB（リージョン）で
+#   設定場所が分かれており、同じIPリストを使うなら両方へ反映する。
+#   さらに IPv4 と IPv6 も別の IPSet になる（AWSの仕様で混在できない）。
+#   → 1つの主体につき最大4回の実行になる。
+IPSET_ARN_DEFAULT=""
 
-# 操作対象の IPSet 名。AWS が生成する ID（UUID）は名前から自動で解決するので設定不要。
-# スコープ内で名前は一意。コンソールの IP sets 画面に出ている名前をそのまま書く。
-IPSET_NAME="crawler-allow-list"
-
-# 許可する最小プレフィックス長。これより広い（数字が小さい）指定は拒否する。
+# 許可する最小プレフィックス長（IPv4）。これより広い（数字が小さい）指定は拒否する。
 # 16 なら /15 以下を拒否＝1件あたり最大 65,536 IP まで。
 # 小さくすると、1行の書き間違いで許可される範囲が一気に広がる。
 MIN_PREFIX_LEN=16
+
+# 許可する最小プレフィックス長（IPv6）。
+# IPv6 は /32 でも IPv4 の全空間より遥かに広いため、既定を 32 にしている。
+# 各社が公開している IPv6 は /32〜/64 が中心。
+MIN_PREFIX_LEN_V6=32
 
 # IPSet に登録できる件数の上限（AWS の固定クォータ）。これを超える操作は事前に止める。
 MAX_ADDRESSES=10000
@@ -128,7 +163,7 @@ MAX_SHRINK_PERCENT=30
 
 # 「--項目名=値」で上書きを許す設定の一覧。
 # ここに無い名前を指定した場合はエラーにする（打ち間違いを黙って無視しないため）。
-OVERRIDABLE="AWS_PROFILE_NAME AWS_REGION IPSET_SCOPE IPSET_NAME MIN_PREFIX_LEN MAX_ADDRESSES MAX_SHRINK_PERCENT LOG_DIR"
+OVERRIDABLE="AWS_PROFILE_NAME MIN_PREFIX_LEN MIN_PREFIX_LEN_V6 MAX_ADDRESSES MAX_SHRINK_PERCENT LOG_DIR"
 
 SCRIPT_NAME="$(basename "$0")"
 IS_PIPE=0
@@ -136,12 +171,28 @@ IS_APPLY=0
 SUBCOMMAND=""
 declare -a INPUT_CIDRS=()
 
-# 取得した IPSet の情報を入れる（func_getIpSet が設定する）
+# ARN から取り出す値（func_parseArn が設定する）。手で書かないこと。
+IPSET_ARN=""
+IPSET_SCOPE=""
+IPSET_NAME=""
 IPSET_ID=""
+
+# AWS から取得する値（func_getIpSet が設定する）。手で書かないこと。
+#
+# LockToken は「読んだ時点の版」を示す使い捨ての値で、更新のたびに変わる。
+# ここに固定値を書くと、他の誰か（コンソール操作を含む）が更新した瞬間に
+# 競合エラーになり、以後ずっと書き込めなくなる。必ず毎回取得する。
 IPSET_LOCK_TOKEN=""
 IPSET_DESCRIPTION=""
 IPSET_IP_VERSION=""
 declare -a CURRENT_ADDRESSES=()
+
+# 入力された CIDR が IPv4 か IPv6 か（func_validateAllInputs が判定して設定する）
+INPUT_IP_VERSION=""
+
+# --arn で指定された内容（func_parseArgs が設定する）
+
+ARN_DIRECT=""
 
 
 # ============================================================================
@@ -150,17 +201,20 @@ declare -a CURRENT_ADDRESSES=()
 main() {
     func_parseArgs "$@"
 
+    # 対象は func_parseArgs の中で ARN から確定済み
     if [ "$SUBCOMMAND" = "list" ]; then
-        func_resolveIpSetId
         func_getIpSet
         func_printList
         exit 0
     fi
 
-    # add / del / replace の共通処理
-    func_validateAllInputs
-    func_resolveIpSetId
+    # add / del / replace / clear の共通処理
+    # clear は CIDR を取らないので入力検証は不要
+    if [ "$SUBCOMMAND" != "clear" ]; then
+        func_validateAllInputs
+    fi
     func_getIpSet
+    func_checkIpVersionMatch
 
     local -a new_addresses=()
     # mapfile   … 出力を「1行＝1要素」として配列に読み込む
@@ -195,29 +249,41 @@ main() {
 #   入参: なし / 出参: なし（使い方を標準エラーに表示）
 func_showUsage() {
     cat >&2 <<'USAGE'
-使い方: waf-ipset.sh <サブコマンド> [CIDR...] [-f ファイル] [--apply] [--pipe]
+使い方: waf-ipset.sh <サブコマンド> [CIDR...] [-f ファイル] [--arn=ARN] [--apply] [--pipe]
 
 サブコマンド:
   list                  現在の登録内容を表示する
   add     <CIDR...>     指定したIPを追加する（既にあるものは無視）
   del     <CIDR...>     指定したIPを削除する（無いものは無視）
   replace -f <ファイル>  全件を置き換える（既存の登録は全て消える）
+  clear                 全件削除して空にする
+
+対象の指定:
+  --arn=<ARN>   操作する IPSet の ARN。省略時は IPSET_ARN_DEFAULT を使う。
+                ARN はコンソールの IP sets 詳細画面に表示されている。
+                リージョン・スコープ・名前・ID はARNから自動で判別する。
 
 オプション:
   --apply   実際に書き込む。付けない場合は必ず模擬実行のみ
   --pipe    余計な表示をせず、終了時にEnter待ちをしない（自動化用）
 
-例:
-  ./waf-ipset.sh list
-  ./waf-ipset.sh add 203.0.113.5/32 --apply
-  ./waf-ipset.sh add -f allow.txt --apply
-  ./waf-ipset.sh del 203.0.113.5/32 --apply
-  ./waf-ipset.sh list --IPSET_NAME=other-list --AWS_REGION=us-east-1
+例（ARNは長いので変数に入れると読みやすい）:
+  ARN=arn:aws:wafv2:ap-northeast-1:123456789012:regional/ipset/名前/ID
+
+  ./waf-ipset.sh list --arn=$ARN
+  ./waf-ipset.sh add 203.0.113.5/32 --arn=$ARN --apply
+  ./waf-ipset.sh add 2001:db8::/32  --arn=$ARN_V6 --apply
+  ./waf-ipset.sh del 203.0.113.5/32 --arn=$ARN --apply
 USAGE
     echo >&2
-    func_showOverridable "$OVERRIDABLE"
+    if [ -n "$IPSET_ARN_DEFAULT" ]; then
+        echo "既定の対象（IPSET_ARN_DEFAULT）:" >&2
+        echo "  $IPSET_ARN_DEFAULT" >&2
+    else
+        echo "既定の対象は未設定です。--arn=<ARN> で指定してください。" >&2
+    fi
     echo >&2
-    echo "現在の値: AWS_REGION=$AWS_REGION IPSET_SCOPE=$IPSET_SCOPE IPSET_NAME=$IPSET_NAME" >&2
+    func_showOverridable "$OVERRIDABLE"
 }
 
 # func_parseArgs
@@ -233,7 +299,7 @@ func_parseArgs() {
     shift
 
     case "$SUBCOMMAND" in
-        list|add|del|replace) ;;
+        list|add|del|replace|clear) ;;
         -h|--help)
             func_showUsage
             exit 0
@@ -262,10 +328,15 @@ func_parseArgs() {
                 mapfile -t -O "${#INPUT_CIDRS[@]}" INPUT_CIDRS < <(func_readCidrFile "$2")
                 shift 2
                 ;;
+            --arn=*)
+                ARN_DIRECT="${1#--arn=}"
+                shift
+                ;;
             --*=*)
                 if ! func_applyConfigOverride "$1" "$OVERRIDABLE"; then
                     func_error "上書きできない設定です: [$1]"
                     func_showOverridable "$OVERRIDABLE"
+                    func_error "対象の指定は --arn=<ARN> を使ってください。"
                     exit 2
                 fi
                 shift
@@ -281,10 +352,14 @@ func_parseArgs() {
         esac
     done
 
+    # 操作対象を確定させる（--arn があればそれ、無ければ既定）
+    func_requireArn
+
     # サブコマンドごとの引数の要不要をチェックする
-    if [ "$SUBCOMMAND" = "list" ]; then
+    # list と clear は CIDR を取らない
+    if [ "$SUBCOMMAND" = "list" ] || [ "$SUBCOMMAND" = "clear" ]; then
         if [ "${#INPUT_CIDRS[@]}" -gt 0 ]; then
-            func_error "list は CIDR を取りません。"
+            func_error "$SUBCOMMAND は CIDR を取りません。"
             exit 2
         fi
         return
@@ -326,15 +401,30 @@ func_readCidrFile() {
 func_validateAllInputs() {
     local cidr
     local ng=0
+    local v4=0 v6=0
+
     for cidr in "${INPUT_CIDRS[@]}"; do
         if ! func_validateCidr "$cidr"; then
             ng=$((ng + 1))
+            continue
         fi
+        if [[ "$cidr" == *:* ]]; then v6=$((v6 + 1)); else v4=$((v4 + 1)); fi
     done
+
     if [ "$ng" -gt 0 ]; then
         func_error "不正な指定が ${ng} 件あります。1件も書き込まずに中止しました。"
         exit 2
     fi
+
+    # IPv4 と IPv6 が混ざっていないか。AWS の IPSet はどちらか一方しか持てない。
+    if [ "$v4" -gt 0 ] && [ "$v6" -gt 0 ]; then
+        func_error "IPv4（${v4}件）と IPv6（${v6}件）が混在しています。"
+        func_error "AWSの仕様上、1つの IPSet に両方を入れることはできません。"
+        func_error "取得スクリプトの --ipv4 / --ipv6 で分けて、それぞれの対象へ反映してください。"
+        exit 2
+    fi
+
+    if [ "$v6" -gt 0 ]; then INPUT_IP_VERSION="IPV6"; else INPUT_IP_VERSION="IPV4"; fi
 
     # 重複指定を検出して知らせる（処理は続行する）
     local dup
@@ -350,10 +440,58 @@ func_validateAllInputs() {
 func_validateCidr() {
     local cidr="$1"
 
+    # コロンを含むなら IPv6 として扱う
     if [[ "$cidr" == *:* ]]; then
-        func_error "[$cidr] IPv6 には未対応です。本スクリプトは IPv4 のみを扱います。"
+        func_validateCidrV6 "$cidr"
+        return $?
+    fi
+    func_validateCidrV4 "$cidr"
+}
+
+# func_validateCidrV6
+#   入参: $1=検査するCIDR文字列（IPv6）
+#   出参: 終了コード 0=正しい / 1=不正（理由を標準エラーに出す）
+#   備考: IPv6 は「::」による省略表記があり、ネットワークアドレスの判定には
+#         128ビットの演算が必要になる。bash では扱いづらく、誤判定して
+#         正しいものを拒否する方が有害なため、ここでは形式と範囲のみ確認する。
+#         ホスト部が0でない場合は AWS 側が拒否する。
+func_validateCidrV6() {
+    local cidr="$1"
+
+    if ! [[ "$cidr" =~ ^([0-9a-fA-F:]+)/([0-9]{1,3})$ ]]; then
+        func_error "[$cidr] 形式が違います。正しい形式: 2001:db8::/32（プレフィックス長は必須）"
         return 1
     fi
+
+    local addr="${BASH_REMATCH[1]}"
+    local prefix="${BASH_REMATCH[2]}"
+
+    # 「::」は1回だけ使える（2回以上あると展開先が定まらない）
+    local double_colon_count
+    double_colon_count=$(printf '%s' "$addr" | grep -o '::' | grep -c . || true)
+    if [ "$double_colon_count" -gt 1 ]; then
+        func_error "[$cidr] 「::」は1つのアドレスに1回しか使えません。"
+        return 1
+    fi
+
+    if [ "$((10#$prefix))" -gt 128 ]; then
+        func_error "[$cidr] IPv6 のプレフィックス長は 128 以下です。"
+        return 1
+    fi
+
+    if [ "$((10#$prefix))" -lt "$MIN_PREFIX_LEN_V6" ]; then
+        func_error "[$cidr] 範囲が広すぎます。/$MIN_PREFIX_LEN_V6 以上を指定してください（設定: MIN_PREFIX_LEN_V6）。"
+        return 1
+    fi
+
+    return 0
+}
+
+# func_validateCidrV4
+#   入参: $1=検査するCIDR文字列（IPv4）
+#   出参: 終了コード 0=正しい / 1=不正（理由を標準エラーに出す）
+func_validateCidrV4() {
+    local cidr="$1"
 
     if ! [[ "$cidr" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})/([0-9]{1,2})$ ]]; then
         func_error "[$cidr] 形式が違います。正しい形式: 203.0.113.0/24（プレフィックス長は必須）"
@@ -426,50 +564,95 @@ func_awsCli() {
     aws "$@" "${opts[@]}"
 }
 
-# func_resolveIpSetId
-#   入参: なし（IPSET_NAME / IPSET_SCOPE を使う）
-#   出参: IPSET_ID を設定する
-func_resolveIpSetId() {
-    func_info "IPSet を検索中: 名前=$IPSET_NAME スコープ=$IPSET_SCOPE リージョン=$AWS_REGION"
+# func_parseArn
+#   入参: $1=IPSet の ARN
+#   出参: IPSET_ARN / AWS_REGION / IPSET_SCOPE / IPSET_NAME / IPSET_ID を設定する
+#   備考: ARN 1つに必要な情報が全て入っているため、
+#         リージョン・スコープ・名前・IDを個別に設定する必要がない。
+func_parseArn() {
+    local arn="$1"
 
-    local err="${LOG_DIR}/aws-stderr-${IPSET_NAME}.tmp"
-    mkdir -p "$LOG_DIR"
+    # ARN の構造（コロン区切りで6つ、最後がスラッシュ区切りで4つ）
+    #   arn : aws : wafv2 : ap-northeast-1 : 123456789012 : regional/ipset/名前/ID
+    #    1     2      3            4              5                   6
+    local a_arn a_partition a_service a_region a_account a_rest
+    IFS=':' read -r a_arn a_partition a_service a_region a_account a_rest <<< "$arn"
 
-    IPSET_ID=$(func_awsCli wafv2 list-ip-sets \
-        --scope "$IPSET_SCOPE" \
-        --query "IPSets[?Name=='${IPSET_NAME}'].Id | [0]" \
-        --output text 2>"$err")
-
-    # aws CLI が出したエラーを握りつぶさない。
-    # crontab では、ここを潰すと原因が永久に分からなくなる。
-    if [ -s "$err" ]; then
-        func_error "aws CLI の呼び出しに失敗しました（wafv2 list-ip-sets）"
-        func_errorDetail "aws CLI が出力した内容:" "$err"
-        func_error "よくある原因と対処:"
-        func_error "  権限不足           → IAMに wafv2:ListIPSets / GetIPSet / UpdateIPSet が必要"
-        func_error "  認証情報の期限切れ → aws sso login 等で取り直す"
-        func_error "  プロファイル誤り   → 現在の指定: ${AWS_PROFILE_NAME:-（既定プロファイル）}"
-        func_error "  リージョン誤り     → 現在の指定: ${AWS_REGION}"
-        func_error "  aws CLI 未インストール → aws --version で確認"
-        rm -f "$err"
-        exit 1
+    if [ "$a_arn" != "arn" ] || [ "$a_service" != "wafv2" ] || [ -z "${a_rest:-}" ]; then
+        func_error "ARN の形式が正しくありません: [$arn]"
+        func_error "正しい形式:"
+        func_error "  arn:aws:wafv2:<リージョン>:<アカウント>:<global|regional>/ipset/<名前>/<ID>"
+        func_error "コンソールの IP sets 詳細画面に表示されている ARN をそのまま貼ってください。"
+        exit 2
     fi
-    rm -f "$err"
 
-    if [ -z "$IPSET_ID" ] || [ "$IPSET_ID" = "None" ]; then
-        func_error "IPSet が見つかりません: [$IPSET_NAME]"
-        func_error "aws CLI の呼び出し自体は成功しているため、権限や認証ではなく指定の問題です。"
-        func_error "確認してください: 名前の綴り / IPSET_SCOPE（$IPSET_SCOPE）/ AWS_REGION（$AWS_REGION）"
-        func_error "一覧を見るには: aws wafv2 list-ip-sets --scope $IPSET_SCOPE --region $AWS_REGION"
-        exit 1
+    local a_scope a_kind a_name a_id
+    IFS='/' read -r a_scope a_kind a_name a_id <<< "$a_rest"
+
+    if [ "$a_kind" != "ipset" ]; then
+        func_error "IPSet の ARN ではありません（種別: ${a_kind:-不明}）: [$arn]"
+        func_error "本スクリプトが操作できるのは IPSet だけです（Web ACL やルールグループは対象外）。"
+        exit 2
     fi
+
+    if [ -z "${a_name:-}" ] || [ -z "${a_id:-}" ]; then
+        func_error "ARN から名前とIDを取り出せません: [$arn]"
+        exit 2
+    fi
+
+    # global / regional は ARN 上の表記。aws CLI に渡す --scope の値とは名前が違う。
+    case "$a_scope" in
+        global)   IPSET_SCOPE="CLOUDFRONT" ;;
+        regional) IPSET_SCOPE="REGIONAL" ;;
+        *)
+            func_error "ARN のスコープが global / regional ではありません: [${a_scope:-空}]"
+            exit 2
+            ;;
+    esac
+
+    IPSET_ARN="$arn"
+    AWS_REGION="$a_region"
+    IPSET_NAME="$a_name"
+    IPSET_ID="$a_id"
+
+    # CloudFront 用の WAF は us-east-1 でしか操作できない（AWSの仕様）。
+    # ARN 自体が us-east-1 になっているはずなので、ここに来るのは ARN の写し間違い。
+    if [ "$IPSET_SCOPE" = "CLOUDFRONT" ] && [ "$AWS_REGION" != "us-east-1" ]; then
+        func_error "CloudFront（global）の IPSet はリージョンが us-east-1 である必要があります。"
+        func_error "指定された ARN のリージョン: $AWS_REGION"
+        exit 2
+    fi
+
+    func_info "対象: ${IPSET_NAME}（${IPSET_SCOPE} / ${AWS_REGION}）"
+}
+
+# func_resolveTarget
+#   入参: なし（ARN_DIRECT / IPSET_ARN_DEFAULT を見る）
+#   出参: なし（func_parseArn を呼んで各変数を設定する）
+func_requireArn() {
+    if [ -n "$ARN_DIRECT" ]; then
+        func_parseArn "$ARN_DIRECT"
+        return
+    fi
+
+    if [ -n "$IPSET_ARN_DEFAULT" ]; then
+        func_parseArn "$IPSET_ARN_DEFAULT"
+        return
+    fi
+
+    func_error "操作対象が指定されていません。"
+    func_error "次のどちらかで指定してください。"
+    func_error "  1) 実行時に指定する : --arn=arn:aws:wafv2:..."
+    func_error "  2) 既定を設定する   : 本スクリプト上部の IPSET_ARN_DEFAULT に書く"
+    func_error "ARN はコンソールの IP sets 詳細画面に表示されています。"
+    exit 2
 }
 
 # func_getIpSet
 #   入参: なし（IPSET_ID を使う）
 #   出参: CURRENT_ADDRESSES / IPSET_LOCK_TOKEN / IPSET_DESCRIPTION / IPSET_IP_VERSION を設定
 func_getIpSet() {
-    local err="${LOG_DIR}/aws-stderr-${IPSET_NAME}.tmp"
+    local err="${LOG_DIR}/aws-stderr-${IPSET_SCOPE}-${IPSET_NAME}.tmp"
     mkdir -p "$LOG_DIR"
 
     local raw
@@ -488,16 +671,35 @@ func_getIpSet() {
     IPSET_LOCK_TOKEN=$(echo "$raw" | cut -f1)
     IPSET_IP_VERSION=$(echo "$raw" | cut -f2)
     IPSET_DESCRIPTION=$(echo "$raw" | cut -f3)
+
+    # Description が未設定の場合、aws CLI は "None" という文字列を返す。
+    # これをそのまま書き戻すと、説明が "None" に書き換わってしまう。
     [ "$IPSET_DESCRIPTION" = "None" ] && IPSET_DESCRIPTION=""
 
-    if [ "$IPSET_IP_VERSION" != "IPV4" ]; then
-        func_error "対象の IPSet は $IPSET_IP_VERSION です。本スクリプトは IPV4 のみ対応しています。"
-        exit 1
-    fi
+    func_info "現在の状態: ${IPSET_IP_VERSION} / LockToken=${IPSET_LOCK_TOKEN}"
 
     mapfile -t CURRENT_ADDRESSES < <(func_awsCli wafv2 get-ip-set \
         --name "$IPSET_NAME" --scope "$IPSET_SCOPE" --id "$IPSET_ID" \
         --query "IPSet.Addresses[]" --output text | tr '\t' '\n' | grep -v '^$' | sort)
+}
+
+# func_checkIpVersionMatch
+#   入参: なし（INPUT_IP_VERSION と IPSET_IP_VERSION を見る）
+#   出参: なし。食い違っていれば中止する
+#   備考: AWS の仕様上、1つの IPSet に IPv4 と IPv6 は混在できない。
+#         IPv6 のリストを IPv4 の IPSet に流し込もうとすると AWS 側で弾かれるが、
+#         その前にこちらで止めて、どの対象を指定すべきか示す。
+func_checkIpVersionMatch() {
+    [ -z "$INPUT_IP_VERSION" ] && return
+    [ "$INPUT_IP_VERSION" = "$IPSET_IP_VERSION" ] && return
+
+    func_error "IPのバージョンが対象の IPSet と一致しません。"
+    func_error "  入力されたCIDR : $INPUT_IP_VERSION"
+    func_error "  対象の IPSet   : $IPSET_IP_VERSION（$IPSET_NAME）"
+    func_error "AWSの仕様上、1つの IPSet に IPv4 と IPv6 は混在できません。"
+    func_error "同じバージョンの IPSet の ARN を --arn で指定してください。"
+    func_error "（IPv4用と IPv6用で別々の IPSet を用意する必要があります）"
+    exit 2
 }
 
 
@@ -521,6 +723,11 @@ func_buildNewAddresses() {
             ;;
         replace)
             printf '%s\n' "${INPUT_CIDRS[@]}" | grep -v '^$' | sort -u
+            ;;
+        clear)
+            # 何も出力しない＝全件削除。
+            # 空の入力を拒否する検証は add / del / replace 向けのもので、
+            # clear は「空にすること」が目的なので、この経路では通す。
             ;;
     esac
 }
@@ -569,8 +776,10 @@ func_printDiff() {
     echo "操作       : $SUBCOMMAND" >&2
     echo "件数       : ${before_n} 件 → ${after_n} 件" >&2
     echo >&2
-    comm -13 <(echo "$before") <(echo "$after") | sed 's/^/  [追加] /' >&2
-    comm -23 <(echo "$before") <(echo "$after") | sed 's/^/  [削除] /' >&2
+    # grep -v '^$' を挟むのは、片方が空のときに echo が出す空行を
+    # comm が1件として扱い、「[追加] 」だけの行が出てしまうため。
+    comm -13 <(echo "$before") <(echo "$after") | grep -v '^$' | sed 's/^/  [追加] /' >&2
+    comm -23 <(echo "$before") <(echo "$after") | grep -v '^$' | sed 's/^/  [削除] /' >&2
     echo "================================================" >&2
 }
 
@@ -643,7 +852,7 @@ func_updateIpSetApply() {
     local json_file new_token
     json_file=$(func_writeUpdateJson "$@")
 
-    local err="${LOG_DIR}/aws-stderr-${IPSET_NAME}.tmp"
+    local err="${LOG_DIR}/aws-stderr-${IPSET_SCOPE}-${IPSET_NAME}.tmp"
     if ! new_token=$(func_awsCli wafv2 update-ip-set \
         --cli-input-json "file://${json_file}" \
         --query "NextLockToken" --output text 2>"$err"); then
@@ -677,9 +886,11 @@ func_writeUpdateJson() {
     # 理由: 現在の登録内容は ./waf-ipset.sh list でいつでも確認でき、
     #       実行記録は標準エラーに出るので crontab のログに残る。
     #       過去のJSONを貯めても復核の役には立たず、ファイルが際限なく増えるだけ。
-    # IPSet 名をファイル名に入れているのは、主体ごとに別IPSetを扱うため
-    # （同時に走っても互いのファイルを壊さない）。
-    local file="${LOG_DIR}/update-${IPSET_NAME}.json"
+    # ファイル名にスコープと IPSet 名の両方を入れる。
+    # CloudFront と ALB で同じ名前の IPSet を使うことがあり
+    # （実際に今回のテスト環境がそうなっている）、名前だけだと
+    # 両者が同じファイルを奪い合って内容が混ざるため。
+    local file="${LOG_DIR}/update-${IPSET_SCOPE}-${IPSET_NAME}.json"
     mkdir -p "$LOG_DIR"
 
     {
@@ -687,8 +898,16 @@ func_writeUpdateJson() {
         printf '  "Name": "%s",\n' "$IPSET_NAME"
         printf '  "Scope": "%s",\n' "$IPSET_SCOPE"
         printf '  "Id": "%s",\n' "$IPSET_ID"
-        printf '  "Description": "%s",\n' "$IPSET_DESCRIPTION"
         printf '  "LockToken": "%s",\n' "$IPSET_LOCK_TOKEN"
+
+        # Description は「空文字を送ると AWS に拒否される」。
+        # WAFv2 の仕様で最低1文字必要なため、未設定の IPSet に対して
+        # "Description": "" を送ると WAFInvalidParameterException になる。
+        # 未設定のときは、この項目ごと出力しない（省略すれば現状維持になる）。
+        if [ -n "$IPSET_DESCRIPTION" ]; then
+            printf '  "Description": "%s",\n' "$IPSET_DESCRIPTION"
+        fi
+
         printf '  "Addresses": [\n'
         local first=1 addr
         for addr in "$@"; do
